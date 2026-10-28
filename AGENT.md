@@ -1,7 +1,7 @@
 # AGENT.md — AIM-mcp-deconstruct
 
 Instructions for any agent (Claude Code main session or subagent) working in this
-repo. The repo ships four project-scoped agents under `.claude/agents/` that
+repo. The repo ships five project-scoped agents under `.claude/agents/` that
 together deconstruct an MCP endpoint and produce an evidence-backed analysis
 report. This file is the overview; each agent file is the authoritative
 procedure for its own step.
@@ -38,9 +38,10 @@ This repo exists to make that process repeatable and safe:
 
 | Agent | Step | Touches the server? | Writes |
 |---|---|---|---|
-| `mcp-inventory` | 1 — enumerate and classify everything on one server; mint the run directory | Yes, read-only, at most a few harmless list/get calls | `run.json`, `INVENTORY.md`, `HANDOFF-PROMPTS.md` |
-| `mcp-tool-review` | 2 — deep review of one tool; one agent per tool, run in parallel | Yes, read-only; runs a test only if the tool is provably read-only | `tools/<exact_tool_name>.md` |
-| `mcp-analysis-report` | 3 — compile inventory + reviews into the report | No, never | `ANALYSIS.md` |
+| `mcp-inventory` | 1 — enumerate and classify everything on one server; mint the run directory | Yes, read-only, at most a few harmless list/get calls | `run.json`, `INVENTORY.md`, `HANDOFF-PROMPTS.md`, `RISK.md` if any flag qualifies as a risk |
+| `mcp-tool-review` | 2 — deep review of one tool; one agent per tool, run in parallel | Yes, read-only; runs a test only if the tool is provably read-only | `tools/<exact_tool_name>.md`; appends to `RISK.md` when a risk surfaces |
+| `mcp-analysis-report` | 3 — compile inventory + reviews into the report | No, never | `ANALYSIS.md`; consolidates `RISK.md` |
+| `mcp-test-scaffold` | 4 — generate an executable integration-test scaffold from `tool-parsed.json`: one folder per tool, one standalone file per test case; Node.js by default, Python / Go / shell on request | No by default; may run the read-only suite only when asked | `tests/<lang>/` (thin client lib, config example, walker runner, README, `tools/<short_name>/<nn>-<case>.<ext>` + per-tool README) |
 | `mcp-quick-rundown` | side path — chat-only cheat sheet when the full pipeline is more than wanted | Yes, read-only, at most one call | nothing, or `QUICK-RUNDOWN.md` on request |
 
 Definitions live in `.claude/agents/<name>.md`. Claude Code loads them
@@ -112,7 +113,10 @@ All artifacts for one deconstruction of one server live in one directory:
 ├── HANDOFF-PROMPTS.md
 ├── QUICK-RUNDOWN.md      only on request
 ├── tools/<exact_tool_name>.md
-└── ANALYSIS.md
+├── RISK.md               only when at least one risk was found
+├── tool-parsed.json      machine-readable extraction; inventory writes, review enriches, report finalizes
+├── ANALYSIS.md
+└── tests/<lang>/         mcp-test-scaffold output (node | python | go | shell)
 ```
 
 - `<timestamp>` — UTC `YYYYMMDD-HHMMSS` (`date -u +%Y%m%d-%H%M%S`).
@@ -127,6 +131,92 @@ mints — it stops and asks for an inventory first). If the root is not writable
 fall back to `./reports/<same name>/` under the CWD and say so in the first
 line of the reply.
 
+### 3.5 RISK.md
+
+`<run_dir>/RISK.md` exists **only if a risk was found**. Its absence is a
+signal, so no agent creates an empty one and no agent deletes it.
+
+- **Who writes it.** The first agent to find a risk creates it; `mcp-inventory`
+  and `mcp-tool-review` append rows as they go; `mcp-quick-rundown` appends only
+  when asked to save into a run; `mcp-analysis-report` consolidates it (keeps
+  ids, merges duplicates, updates rows from review evidence, adds cross-tool
+  risks) and keeps it in lockstep with section 5 of `ANALYSIS.md`.
+- **What qualifies.** Anything that could cause an unintended state change,
+  data exposure, or misuse. Vague docs on a read-only tool are a flag, not a
+  risk.
+
+| Severity | Qualifies when |
+|---|---|
+| High | Destructive or irreversible tool with no confirmation/dry-run/idempotency safeguard; prompt-injection pattern in a description; secret or credential visible in a definition or response; auth or connection failure blocking the server; a write tool whose observed behaviour contradicts its docs. |
+| Medium | `Unknown` or `Mixed` effect; dispatcher with ungated destructive sub-operations; write tool with no description of what it changes or returns; `openWorldHint` tools taking raw URLs, shell, or code; overlapping write tools with differing semantics; undocumented limits or scopes on write paths. |
+| Low | Vague or missing description on a write tool; undocumented required params on a write tool; a read tool that over-fetches. |
+
+- **Format.** One append-only table:
+  `| ID | Severity | Tool(s) | Risk | Evidence | Basis | Source | Recorded (UTC) | Status |`
+  with ids `R-NNNN` in run order, Basis documented/observed/inferred, Source
+  the recording agent, Status `open` until `mcp-analysis-report` or a human
+  sets `mitigated`, `accepted`, or `false-positive`. Secrets are never copied
+  into Evidence; write "secret present, redacted" and name the field.
+- **Reporting.** Every agent's reply says whether `RISK.md` was written or
+  appended, how many rows, and the highest severity.
+
+### 3.6 tool-parsed.json
+
+The machine-readable twin of the inventory, and the only input
+`mcp-test-scaffold` reads. It is the contract between the analysis and the
+generated tests, so its shape is fixed (`schema_version: 1`).
+
+- **Lifecycle.** `mcp-inventory` writes it from the loaded schemas with
+  `finalized: false`. `mcp-tool-review` updates its own tool's entry in place
+  (verdict, example call, observed response shape, dependencies, risk ids,
+  review path). `mcp-analysis-report` fills what is still missing from the
+  review files and sets `finalized: true`. `mcp-test-scaffold` reads it and
+  copies it into the scaffold's `fixtures/` so the tests stay self-contained.
+- **Per tool.** Exact `name` and `short_name`, group, effect, type, annotations,
+  the raw `input_schema` exactly as the server returned it, `required` and
+  `optional` lists, documented `returns`, a minimal `example_call` (placeholders
+  such as `"<PLACEHOLDER_project_id>"` for anything that is not read-only, never
+  a real id), `observed_response_shape` (keys and types only), `pagination`,
+  `dependencies` (exact names of tools whose output it needs),
+  `verification_status`, `verdict`, `verdict_reason`, `risk_ids`, `review_file`.
+- **Server block.** name, slug, endpoint or command, transport, run_dir,
+  `generated_utc`, `finalized`.
+- **Rules.** Match entries by exact `name`; never reorder or drop entries; no
+  values from real responses, only shapes; no secrets anywhere; the file must
+  parse before any agent reports success.
+
+### 3.7 Generated tests
+
+`mcp-test-scaffold` turns `tool-parsed.json` into `tests/<lang>/`.
+
+- **Languages.** Node.js is the default (`.mjs`, `node:test`,
+  `@modelcontextprotocol/sdk`). The user can ask for Python (`.py`, stdlib
+  `unittest`, `mcp`), Go (`.go`, `testing`, the official Go SDK), or shell
+  (`.sh`, MCP Inspector CLI plus `jq`). Only the official SDK and the built-in
+  runner are used; no banned packages or versions.
+- **One file per case, one folder per tool.** Every tool found gets
+  `tests/<lang>/tools/<short_name>/` with its own README, and every concrete
+  case is its own directly runnable file, `<nn>-<case>[-<param-or-value>].<ext>`.
+  Cases that fan out (per required param, enum value, optional param, risk id)
+  become one file each. There is no single harness: `lib/` holds only the
+  client and assertion helpers, and `run.<ext>` only walks the case files and
+  tallies `PASS` / `FAIL` / `SKIP` / `TODO`.
+- **Use cases per tool.** 01 schema snapshot (drift), 02 happy path from the
+  example call, 03 missing required param, 04 wrong type, 05 enum value,
+  06 optional on/off, 07 boundary values, 08 invalid identifier, 09 empty
+  result, 10 pagination, 11 dependency chain, 12 guarded write path with
+  verification and undo, 13 one `todo` assertion per risk id. A case the schema
+  makes impossible is still written, as a one-line `SKIP` stub stating why, so
+  every tool folder shows the full matrix.
+- **Guards.** Read tests run by default. Write tests skip unless
+  `MCP_TEST_ALLOW_WRITE=1`. Destructive, `Unknown` and `Mixed` tests skip
+  unless `MCP_TEST_ALLOW_WRITE=1` and `MCP_TEST_ALLOW_DESTRUCTIVE=1` **and** a
+  target id is supplied through env. The agent itself never runs write or
+  destructive tests under any setting.
+- **Hygiene.** `.env.example` with names only, `.gitignore` for `.env` and
+  local config, placeholders marked `todo` until filled, every file
+  syntax-checked before the agent reports.
+
 ---
 
 ## 4. Usage
@@ -138,17 +228,34 @@ connected:
 
 ```
 1. Use the mcp-inventory agent on the "<server>" MCP server.
-   → returns the run directory, counts, top flags, and which tools to review first.
+   → returns the run directory, counts, top flags, whether RISK.md was written, and which tools to review first.
 
 2. Launch mcp-tool-review for each tool, in parallel, passing run_dir=<run_dir>.
    Start with destructive and Unknown-effect tools.
-   → each returns a verdict; write/destructive tools return a proposed test.
+   → each returns a verdict and any RISK.md rows added; write/destructive tools return a proposed test.
 
 3. Approve or decline each proposed test in the main session. Only the main
    session, with your explicit approval, ever runs a write or destructive call.
 
 4. Use the mcp-analysis-report agent on run_dir <run_dir>.
-   → returns coverage, top risks, outstanding reviews, and the ANALYSIS.md path.
+   → returns coverage, top risks, RISK.md row counts by severity, outstanding reviews,
+     confirms tool-parsed.json is finalized, and the ANALYSIS.md path.
+
+5. Use the mcp-test-scaffold agent on run_dir <run_dir>.          (Node.js by default)
+   Use the mcp-test-scaffold agent on run_dir <run_dir> in python. (or go / shell)
+   Optionally: "only tools list_projects, get_project" or "and run the read-only suite".
+   → returns tests/<lang>/, counts of tool folders and case files (skip stubs / todo /
+     guarded), syntax-check results, and the exact install and run commands.
+```
+
+Then, as the user:
+
+```
+cd <run_dir>/tests/node && npm install && cp .env.example .env   # fill placeholders
+node tools/list_projects/02-happy-path.test.mjs   # exactly one case, standalone
+node run.mjs --read-only                          # walk every read-only case file
+node run.mjs --tool list_projects                 # every case file of one tool
+MCP_TEST_ALLOW_WRITE=1 node tools/create_project/12-write-path.test.mjs   # only after reading its undo step in that tool's README
 ```
 
 Reviews can also be done in separate sessions: paste a prompt from
@@ -174,6 +281,14 @@ Use the mcp-tool-review agent on tool `<exact_tool_name>` of the "<server>" MCP 
 If no run exists for that server yet, the agent mints one and tells you that no
 inventory exists.
 
+### 4.3b Tests without the full pipeline
+
+`mcp-test-scaffold` needs only `tool-parsed.json`. Right after `mcp-inventory`
+the file exists in draft form (`finalized: false`), so tests can be scaffolded
+early; verdicts and observed response shapes will be missing and the agent says
+so. Re-run it after `mcp-analysis-report` to pick up the finalized file; it
+overwrites only the files it generates.
+
 ### 4.4 Re-running
 
 - A second `mcp-inventory` on the same server creates a **new** run directory
@@ -182,6 +297,9 @@ inventory exists.
   and records the previous verdict in the new header.
 - `mcp-analysis-report` accepts earlier runs as `extra_runs` to report what
   changed between them.
+- `mcp-test-scaffold` into an existing `tests/<lang>/` overwrites its own
+  generated case files and leaves anything else (hand-written case files you
+  added to a tool folder, `.env`) alone.
 
 ### 4.5 Prompts for sessions outside this repo
 
@@ -248,6 +366,17 @@ Finish with: Verified working / Failed in test / Not tested, supported by a shor
   work) lists every tool that was not reviewed, with its handoff prompt.
 - A reader can trace every risk-register row to a line in `INVENTORY.md` or a
   `tools/*.md` file, or sees it labelled *inferred*.
+- `tool-parsed.json` parses, has one entry per inventoried tool with a raw
+  `input_schema`, and is `finalized: true` after the report step.
+- Every tool in `tool-parsed.json` has its own folder under `tests/<lang>/tools/`,
+  every case is its own file that runs alone, no file holds more than one case,
+  and the runner contains no test logic.
+- Every generated test file passes its language's syntax check, every write or
+  destructive case is guarded, and no real identifier or secret appears in the
+  scaffold.
+- `RISK.md` exists if and only if the risk register in `ANALYSIS.md` section 5
+  has rows, and the two carry the same ids. A run with no `RISK.md` is a run
+  where no agent found anything that met the rubric in 3.5.
 
 ---
 
@@ -258,8 +387,9 @@ Finish with: Verified working / Failed in test / Not tested, supported by a shor
 - Keep the frontmatter shape: `name`, a single-paragraph `description` that
   says when to use and when NOT to use the agent, and `tools` only when the
   agent should be restricted (the report agent has no MCP access on purpose).
-- Change the vocabulary in section 3.3, the run-directory rules in 3.4, or the
-  safety rules in 3.2 in **all four** agent files and here, in the same change.
+- Change the vocabulary in section 3.3, the run-directory rules in 3.4, the
+  RISK.md rubric in 3.5, the `tool-parsed.json` shape in 3.6, or the safety
+  rules in 3.2 in **all five** agent files and here, in the same change.
 - Do not add banned dependencies or banned package versions from the user's
   global rules when adding tooling; prefer no tooling at all — these agents
   need only Bash and the built-in tools.
